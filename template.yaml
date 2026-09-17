@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Media Archive compresses newly-uploaded JSON objects in an S3
+  bucket into ZIP archives using a Lambda function running inside
+  a private VPC, deployed with AWS SAM.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: media-archive
+    Description: Prefix used to name/tag every resource in this stack.
+  VpcCidr:
+    Type: String
+    Default: 10.10.0.0/16
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.10.1.0/24
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.10.2.0/24
+
+Globals:
+  Function:
+    Timeout: 90
+    MemorySize: 512
+    Tracing: Active
+
+Resources:
+
+  # Dedicated VPC for the archive Lambda, with two private subnets (one per AZ).
+  ArchiveVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpc
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ArchiveVPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-subnet-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ArchiveVPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-subnet-2
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ArchiveVPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-rt
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Lambda Security Group: allows the Lambda to talk to the VPC endpoints for S3, ECR, and CloudWatch Logs. No inbound rules are needed because the Lambda is the client in all of those conversations.
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the archive Lambda ENIs
+      VpcId: !Ref ArchiveVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-lambda-sg
+
+  # S3 Gateway endpoint (for Lambda to talk to S3 without going through the public Internet)
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ArchiveVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  # ECR API endpoint (for Lambda to talk to ECR API)
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ArchiveVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref LambdaSecurityGroup]
+
+  # ECR DKR endpoint (for Lambda to pull the Docker image from ECR)
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ArchiveVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref LambdaSecurityGroup]
+
+  # CloudWatch Logs endpoint (for Lambda to write logs to CloudWatch)
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ArchiveVPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref LambdaSecurityGroup]
+
+  # Archive S3 Bucket 
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Archive Lambda Function: the Dockerized Lambda, deployed inside the private subnets, triggered on every new object under incoming/*.json. AutoPublishAlias tells SAM to publish an immutable numbered Lambda version on every deploy and move the "live" alias to it, which is what makes rollback to a prior release a one-line `aws lambda update-alias` rather than a redeploy.
+  ArchiveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Architectures:
+        - x86_64
+      AutoPublishAlias: live
+      Environment:
+        Variables:
+          ARCHIVE_PREFIX: archive/
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Sub ${ProjectName}-${AWS::AccountId}-${AWS::Region}
+        - VPCAccessPolicy: {}
+      Events:
+        NewJsonObject:
+          Type: S3
+          Properties:
+            Bucket: !Ref ArchiveBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+                  - Name: suffix
+                    Value: .json
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./src
+      DockerTag: latest
+
+# Outputs section provides information about the resources created in the stack, such as VPC ID, private subnet IDs, S3 bucket name, Lambda function name, and the live alias for the Lambda function.
+Outputs:
+  VpcId:
+    Value: !Ref ArchiveVPC
+  PrivateSubnetIds:
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+  ArchiveBucketName:
+    Value: !Ref ArchiveBucket
+  ArchiveFunctionName:
+    Value: !Ref ArchiveFunction
+  ArchiveFunctionLiveAlias:
+    Description: Invoke/rollback target - always points at the currently-live version
+    Value: !Sub ${ArchiveFunction}:live

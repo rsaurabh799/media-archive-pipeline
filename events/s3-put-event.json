@@ -1,0 +1,19 @@
+{
+  "Records": [
+    {
+      "eventVersion": "2.1",
+      "eventSource": "aws:s3",
+      "awsRegion": "us-east-1",
+      "eventName": "ObjectCreated:Put",
+      "s3": {
+        "bucket": {
+          "name": "s3-media-archive-testing-01"
+        },
+        "object": {
+          "key": "incoming/render-job-48213.json",
+          "size": 10485760
+        }
+      }
+    }
+  ]
+}
